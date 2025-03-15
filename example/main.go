@@ -26,7 +26,9 @@ func main() {
 
 	log.Info().Msg("getting latest events")
 
-	events, err := gdelt.FetchLatestEvents(gdelt.DefaultOpts)
+	opts := gdelt.DefaultOpts
+	opts.Translingual = false
+	events, err := gdelt.FetchLatestEvents(opts)
 	if err != nil {
 		log.Fatal().Err(err).Msg("error fetching latest events")
 	}
