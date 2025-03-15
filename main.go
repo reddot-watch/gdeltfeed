@@ -236,7 +236,6 @@ func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
 
 // CollectNews simulates news collection
 func (f *NewsFeed) CollectNews() {
-	// This is where you would implement your actual news collection logic
 	log.Printf("Collecting news...")
 
 	opts := gdelt.DefaultOpts
