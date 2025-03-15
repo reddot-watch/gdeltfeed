@@ -1,4 +1,4 @@
-module github.com/nlpodyssey/gdelt
+module github.com/reddot-watch/gdeltfeed
 
 go 1.24
 
