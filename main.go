@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/reddot-watch/gdeltfeed/internal/gdelt"
+	"github.com/reddot-watch/prefilter"
 	"github.com/rs/zerolog/log"
 )
 
@@ -35,6 +36,7 @@ type NewsFeed struct {
 	Channel      Channel  `xml:"channel"`
 	newsItemsMux sync.RWMutex
 	db           *sql.DB
+	filter       *prefilter.Filter
 }
 
 // Channel contains feed metadata and items
@@ -72,6 +74,12 @@ func NewNewsFeed(title, link, description, dbPath string) (*NewsFeed, error) {
 		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
 
+	prefilter, err := prefilter.NewFilter("en", prefilter.DefaultOptions())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create filter: %w", err)
+	}
+
 	return &NewsFeed{
 		Version: "2.0",
 		Channel: Channel{
@@ -82,7 +90,8 @@ func NewNewsFeed(title, link, description, dbPath string) (*NewsFeed, error) {
 			LastBuildDate: time.Now(),
 			Items:         []NewsItem{},
 		},
-		db: db,
+		db:     db,
+		filter: prefilter,
 	}, nil
 }
 
@@ -119,19 +128,19 @@ func (f *NewsFeed) LinkExists(link string) (bool, error) {
 }
 
 // AddNewsItem adds a news item to the feed and database
-func (f *NewsFeed) AddNewsItem(item NewsItem) error {
+func (f *NewsFeed) AddNewsItem(item NewsItem) (bool, error) {
 	f.newsItemsMux.Lock()
 	defer f.newsItemsMux.Unlock()
 
 	// Check if link already exists
 	exists, err := f.LinkExists(item.Link)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if exists {
 		log.Printf("Skipping item with duplicate link: %s", item.Link)
-		return nil // Skip without error
+		return false, nil // Skip without error
 	}
 
 	// Generate a truly unique GUID if one wasn't provided
@@ -146,15 +155,14 @@ func (f *NewsFeed) AddNewsItem(item NewsItem) error {
 		item.Title, item.Link, item.Description, item.PubDate.Format(time.RFC3339), item.GUID, item.Source,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to insert news item: %w", err)
+		return false, fmt.Errorf("failed to insert news item: %w", err)
 	}
 
-	// Prune old items
-	return f.pruneFeed()
+	return true, nil
 }
 
-// pruneFeed removes items older than 24 hours
-func (f *NewsFeed) pruneFeed() error {
+// PruneFeed removes items older than 24 hours
+func (f *NewsFeed) PruneFeed() error {
 	cutoffTime := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
 	_, err := f.db.Exec("DELETE FROM news_items WHERE pub_date < ?", cutoffTime)
 	if err != nil {
@@ -234,20 +242,26 @@ func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(xmlData)
 }
 
-// CollectNews simulates news collection
-func (f *NewsFeed) CollectNews() {
-	log.Printf("Collecting news...")
+// CollectNews fetches and processes news
+func (f *NewsFeed) CollectNews() error {
+	log.Info().Msg("Collecting news...")
 
 	opts := gdelt.DefaultOpts
 	opts.Translingual = false
 	events, err := gdelt.FetchLatestEvents(opts)
 	if err != nil {
-		log.Fatal().Err(err).Msg("error fetching latest events")
+		return fmt.Errorf("error fetching latest events: %w", err)
 	}
 
-	log.Printf("processing %d events", len(events))
+	log.Info().Int("count", len(events)).Msg("processing events")
 
+	collected := 0
 	for _, event := range events {
+		if !f.filter.Match(event.GKGArticle.Extras.PageTitle) {
+			log.Debug().Str("title", event.GKGArticle.Extras.PageTitle).Msg("skipping event due to filter")
+			continue
+		}
+
 		newItem := NewsItem{
 			Title:   event.GKGArticle.Extras.PageTitle,
 			Link:    event.SourceURL,
@@ -257,13 +271,17 @@ func (f *NewsFeed) CollectNews() {
 
 		newItem.GUID = GenerateGUID(newItem)
 
-		if err := f.AddNewsItem(newItem); err != nil {
-			log.Warn().Err(err).Msg("error adding new item")
+		if inserted, err := f.AddNewsItem(newItem); err != nil {
+			log.Warn().Err(err).Str("title", newItem.Title).Msg("error adding new item")
+			// Continue with other items rather than failing completely
 			continue
+		} else if inserted {
+			collected += 1
 		}
 	}
 
-	log.Printf("Collected %d new items", len(events))
+	log.Info().Int("count", collected).Msgf("collected %d items", collected)
+	return nil
 }
 
 func main() {
@@ -281,13 +299,29 @@ func main() {
 	}
 	defer feed.Close()
 
-	ticker := time.NewTicker(10 * time.Minute)
+	newsCollectionTicker := time.NewTicker(10 * time.Minute)
+	feedPruningTicker := time.NewTicker(24 * time.Hour)
+
 	go func() {
 		// Collect news immediately at startup
-		feed.CollectNews()
+		if err := feed.CollectNews(); err != nil {
+			log.Error().Err(err).Msg("initial news collection failed")
+			// Consider if you want to exit here or continue with the tickers
+		}
 
-		for range ticker.C {
-			feed.CollectNews()
+		for {
+			select {
+			case <-newsCollectionTicker.C:
+				if err := feed.CollectNews(); err != nil {
+					log.Error().Err(err).Msg("periodic news collection failed")
+					// Continue execution, don't exit the goroutine
+				}
+			case <-feedPruningTicker.C:
+				if err := feed.PruneFeed(); err != nil {
+					log.Error().Err(err).Msg("feed pruning failed")
+					// Continue execution, don't exit the goroutine
+				}
+			}
 		}
 	}()
 
