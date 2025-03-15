@@ -234,7 +234,7 @@ func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(xmlData)
 }
 
-// CollectNews simulates news collection (replace with your actual collection logic)
+// CollectNews simulates news collection
 func (f *NewsFeed) CollectNews() {
 	// This is where you would implement your actual news collection logic
 	log.Printf("Collecting news...")
