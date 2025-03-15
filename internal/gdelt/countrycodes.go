@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package internal
+package gdelt
 
 // FIPS104ToISO31661 maps FIPS 10-4 country codes to ISO 3166-1 alpha2 codes
 var FIPS104ToISO31661 = map[string]string{
