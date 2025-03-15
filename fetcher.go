@@ -100,6 +100,9 @@ func filterEvents(evs []*Event, opts Opts) (_ []*Event, err error) {
 
 	visitedURLs := make(map[string]struct{}, len(evs))
 
+	now := time.Now().UTC()
+	oneDayFuture := now.Add(24 * time.Hour)
+
 	for _, ev := range evs {
 		if len(ev.SourceURL) == 0 || ev.GKGArticle == nil || len(ev.GKGArticle.Extras.PageTitle) == 0 {
 			continue
@@ -109,7 +112,7 @@ func filterEvents(evs []*Event, opts Opts) (_ []*Event, err error) {
 			// Ignore the error, just discard the event.
 			continue
 		}
-		if opts.SkipFutureEvents && publishedAt.After(time.Now()) {
+		if opts.SkipFutureEvents && publishedAt.UTC().After(oneDayFuture) {
 			// Ignore future events.
 			continue
 		}
@@ -157,7 +160,8 @@ func getLatestEvents(url string) (_ []*Event, err error) {
 	am := make(map[string]*Article, len(articles))
 	for _, a := range articles {
 		if _, ok := am[a.DocumentIdentifier]; ok {
-			return nil, fmt.Errorf("duplicate document identifier in articles: %q", a.DocumentIdentifier)
+			log.Warn().Str("document_identifier", a.DocumentIdentifier).Msg("duplicate document identifier in articles")
+			continue
 		}
 		am[a.DocumentIdentifier] = a
 	}
