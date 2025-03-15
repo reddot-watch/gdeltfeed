@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nlpodyssey/gdelt"
+	gdelt "github.com/nlpodyssey/gdelt/internal"
 	"github.com/rs/zerolog/log"
 )
 
