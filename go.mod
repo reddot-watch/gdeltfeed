@@ -5,7 +5,7 @@ go 1.24
 require (
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-sqlite3 v1.14.24
-	github.com/reddot-watch/prefilter v0.0.0-20250315142841-49418dfb27c4
+	github.com/reddot-watch/prefilter v0.0.0-20250315185623-0bd205d0369b
 	github.com/rs/zerolog v1.33.0
 )
 

@@ -12,8 +12,8 @@ github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D
 github.com/mattn/go-sqlite3 v1.14.24 h1:tpSp2G2KyMnnQu99ngJ47EIkWVmliIizyZBfPrBWDRM=
 github.com/mattn/go-sqlite3 v1.14.24/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
-github.com/reddot-watch/prefilter v0.0.0-20250315142841-49418dfb27c4 h1:mSt448WIZyD0sVVXCbnZa/W3tzM2hgZJmkiuHTTH1nY=
-github.com/reddot-watch/prefilter v0.0.0-20250315142841-49418dfb27c4/go.mod h1:7pLoeaXJT/eoPe8i3ibHwWoMWNLKl/6x9MPBlxCVaPI=
+github.com/reddot-watch/prefilter v0.0.0-20250315185623-0bd205d0369b h1:+NS/jRYnsk1jh/wMI0rHismnXrRyx+3jdiuYSG60YWc=
+github.com/reddot-watch/prefilter v0.0.0-20250315185623-0bd205d0369b/go.mod h1:7pLoeaXJT/eoPe8i3ibHwWoMWNLKl/6x9MPBlxCVaPI=
 github.com/rs/xid v1.5.0/go.mod h1:trrq9SKmegXys3aeAKXMUTdJsYXVwGY3RLcfgqegfbg=
 github.com/rs/zerolog v1.33.0 h1:1cU2KZkvPxNyfgEmhHAz/1A9Bz+llsdYzklWFzgp0r8=
 github.com/rs/zerolog v1.33.0/go.mod h1:/7mN4D5sKwJLZQ2b/znpjC3/GQWY/xaDXUM0kKWRHss=

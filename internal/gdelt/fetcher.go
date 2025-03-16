@@ -17,6 +17,7 @@ package gdelt
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/csv"
 	"errors"
@@ -79,7 +80,8 @@ type Opts struct {
 }
 
 // FetchLatestEvents returns the latest GDELT events.
-func FetchLatestEvents(opts Opts) (_ []*Event, err error) {
+// TODO: use the context
+func FetchLatestEvents(_ context.Context, opts Opts) (_ []*Event, err error) {
 	a, err := getLatestEvents(LastUpdateURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get latest events from %q: %w", LastUpdateURL, err)

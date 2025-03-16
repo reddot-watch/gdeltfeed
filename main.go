@@ -1,22 +1,90 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/reddot-watch/gdeltfeed/internal/gdelt"
 	"github.com/reddot-watch/prefilter"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+// Config holds application configuration
+type Config struct {
+	Port                  int
+	DBPath                string
+	FeedTitle             string
+	FeedLink              string
+	FeedDescription       string
+	NewsCollectionMinutes int
+	FeedPruningHours      int
+	MaxDBConnections      int
+	RequestTimeout        time.Duration
+	MaxRequestsPerMinute  int
+}
+
+// LoadConfig loads configuration from environment variables and flags
+func LoadConfig() Config {
+	var config Config
+
+	// Define flags
+	flag.IntVar(&config.Port, "port", getEnvInt("PORT", 8080), "Port to run the web server on")
+	flag.StringVar(&config.DBPath, "db-path", getEnvStr("DB_PATH", "./gdelt_news_feed.db"), "Path to SQLite database")
+	flag.StringVar(&config.FeedTitle, "feed-title", getEnvStr("FEED_TITLE", "GDELT Feed"), "Title of the RSS feed")
+	flag.StringVar(&config.FeedLink, "feed-link", getEnvStr("FEED_LINK", "https://reddot.watch/gdelt"), "Link to the feed")
+	flag.StringVar(&config.FeedDescription, "feed-desc", getEnvStr("FEED_DESCRIPTION", "A collection of GDELT news items from the last 24 hours"), "Feed description")
+	flag.IntVar(&config.NewsCollectionMinutes, "collection-minutes", getEnvInt("COLLECTION_MINUTES", 10), "How often to collect news (in minutes)")
+	flag.IntVar(&config.FeedPruningHours, "pruning-hours", getEnvInt("PRUNING_HOURS", 24), "How often to prune the feed (in hours)")
+	flag.IntVar(&config.MaxDBConnections, "max-db-connections", getEnvInt("MAX_DB_CONNECTIONS", 10), "Maximum database connections")
+	flag.DurationVar(&config.RequestTimeout, "request-timeout", getEnvDuration("REQUEST_TIMEOUT", 10*time.Second), "HTTP request timeout")
+	flag.IntVar(&config.MaxRequestsPerMinute, "max-requests", getEnvInt("MAX_REQUESTS_PER_MINUTE", 60), "Maximum requests per minute")
+
+	flag.Parse()
+	return config
+}
+
+// Helper functions for environment variables
+func getEnvStr(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if valueStr, exists := os.LookupEnv(key); exists {
+		if value, err := strconv.Atoi(valueStr); err == nil {
+			return value
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if valueStr, exists := os.LookupEnv(key); exists {
+		if value, err := time.ParseDuration(valueStr); err == nil {
+			return value
+		}
+	}
+	return fallback
+}
 
 // NewsItem represents a single news article
 type NewsItem struct {
@@ -29,6 +97,24 @@ type NewsItem struct {
 	Source      string    `xml:"source,omitempty"`
 }
 
+// Validate ensures the NewsItem has valid data
+func (item *NewsItem) Validate() error {
+	if item.Title == "" {
+		return errors.New("news item title cannot be empty")
+	}
+	if item.Link == "" {
+		return errors.New("news item link cannot be empty")
+	}
+	return nil
+}
+
+// Sanitize makes the news item XML-safe
+func (item *NewsItem) Sanitize() {
+	item.Title = html.EscapeString(item.Title)
+	item.Description = html.EscapeString(item.Description)
+	item.Source = html.EscapeString(item.Source)
+}
+
 // NewsFeed represents the RSS feed
 type NewsFeed struct {
 	XMLName      xml.Name `xml:"rss"`
@@ -37,6 +123,8 @@ type NewsFeed struct {
 	newsItemsMux sync.RWMutex
 	db           *sql.DB
 	filter       *prefilter.Filter
+	config       Config
+	rateLimiter  *RateLimiter
 }
 
 // Channel contains feed metadata and items
@@ -49,16 +137,69 @@ type Channel struct {
 	Items         []NewsItem `xml:"item"`
 }
 
+// RateLimiter implements a simple token bucket rate limiter
+type RateLimiter struct {
+	tokens        int
+	maxTokens     int
+	tokenInterval time.Duration
+	mu            sync.Mutex
+	lastRefill    time.Time
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(maxRequestsPerMinute int) *RateLimiter {
+	return &RateLimiter{
+		tokens:        maxRequestsPerMinute,
+		maxTokens:     maxRequestsPerMinute,
+		tokenInterval: time.Minute / time.Duration(maxRequestsPerMinute),
+		lastRefill:    time.Now(),
+	}
+}
+
+// Allow checks if a request is allowed based on rate limits
+func (rl *RateLimiter) Allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// Refill tokens based on elapsed time
+	now := time.Now()
+	elapsed := now.Sub(rl.lastRefill)
+	newTokens := int(elapsed / rl.tokenInterval)
+
+	if newTokens > 0 {
+		rl.tokens = min(rl.tokens+newTokens, rl.maxTokens)
+		rl.lastRefill = now
+	}
+
+	if rl.tokens > 0 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
+
 // NewNewsFeed creates and initializes a new feed with database connection
-func NewNewsFeed(title, link, description, dbPath string) (*NewsFeed, error) {
-	// Open SQLite database
-	db, err := sql.Open("sqlite3", dbPath)
+func NewNewsFeed(ctx context.Context, config Config) (*NewsFeed, error) {
+	db, err := sql.Open("sqlite3", config.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// Set connection pool limits
+	db.SetMaxOpenConns(config.MaxDBConnections)
+	db.SetMaxIdleConns(config.MaxDBConnections / 2)
+	db.SetConnMaxLifetime(1 * time.Hour)
+
+	// Test database connection
+	ctxTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctxTimeout); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
 	// Create table if it doesn't exist
-	_, err = db.Exec(`
+	_, err = db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS news_items (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			title TEXT NOT NULL,
@@ -83,15 +224,17 @@ func NewNewsFeed(title, link, description, dbPath string) (*NewsFeed, error) {
 	return &NewsFeed{
 		Version: "2.0",
 		Channel: Channel{
-			Title:         title,
-			Link:          link,
-			Description:   description,
+			Title:         config.FeedTitle,
+			Link:          config.FeedLink,
+			Description:   config.FeedDescription,
 			Language:      "en-us",
 			LastBuildDate: time.Now(),
 			Items:         []NewsItem{},
 		},
-		db:     db,
-		filter: prefilter,
+		db:          db,
+		filter:      prefilter,
+		config:      config,
+		rateLimiter: NewRateLimiter(config.MaxRequestsPerMinute),
 	}, nil
 }
 
@@ -102,10 +245,10 @@ func (f *NewsFeed) Close() error {
 
 // GenerateGUID creates a unique identifier for a news item
 func GenerateGUID(item NewsItem) string {
-	// Method 1: Use UUID v4 (random)
+	// Use UUID v4 (random)
 	id := uuid.New().String()
 
-	// Method 2: Create deterministic ID based on content
+	// Create deterministic ID based on content
 	// This ensures the same article always gets the same GUID
 	// and helps with deduplication
 	h := sha256.New()
@@ -118,9 +261,9 @@ func GenerateGUID(item NewsItem) string {
 }
 
 // LinkExists checks if a news item with the given link already exists
-func (f *NewsFeed) LinkExists(link string) (bool, error) {
+func (f *NewsFeed) LinkExists(ctx context.Context, link string) (bool, error) {
 	var count int
-	err := f.db.QueryRow("SELECT COUNT(*) FROM news_items WHERE link = ?", link).Scan(&count)
+	err := f.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM news_items WHERE link = ?", link).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check link existence: %w", err)
 	}
@@ -128,28 +271,32 @@ func (f *NewsFeed) LinkExists(link string) (bool, error) {
 }
 
 // AddNewsItem adds a news item to the feed and database
-func (f *NewsFeed) AddNewsItem(item NewsItem) (bool, error) {
+func (f *NewsFeed) AddNewsItem(ctx context.Context, item NewsItem) (bool, error) {
 	f.newsItemsMux.Lock()
 	defer f.newsItemsMux.Unlock()
 
-	// Check if link already exists
-	exists, err := f.LinkExists(item.Link)
+	if err := item.Validate(); err != nil {
+		return false, fmt.Errorf("invalid news item: %w", err)
+	}
+
+	item.Sanitize()
+
+	exists, err := f.LinkExists(ctx, item.Link)
 	if err != nil {
 		return false, err
 	}
 
 	if exists {
-		log.Printf("Skipping item with duplicate link: %s", item.Link)
+		log.Debug().Str("link", item.Link).Msg("Skipping item with duplicate link")
 		return false, nil // Skip without error
 	}
 
-	// Generate a truly unique GUID if one wasn't provided
 	if item.GUID == "" {
 		item.GUID = GenerateGUID(item)
 	}
 
-	// Insert into database - store date in ISO 8601 format
-	_, err = f.db.Exec(
+	_, err = f.db.ExecContext(
+		ctx,
 		`INSERT INTO news_items (title, link, description, pub_date, guid, source) 
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		item.Title, item.Link, item.Description, item.PubDate.Format(time.RFC3339), item.GUID, item.Source,
@@ -161,24 +308,32 @@ func (f *NewsFeed) AddNewsItem(item NewsItem) (bool, error) {
 	return true, nil
 }
 
-// PruneFeed removes items older than 24 hours
-func (f *NewsFeed) PruneFeed() error {
-	cutoffTime := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
-	_, err := f.db.Exec("DELETE FROM news_items WHERE pub_date < ?", cutoffTime)
+// PruneFeed removes items older than the specified pruning hours
+func (f *NewsFeed) PruneFeed(ctx context.Context) error {
+	cutoffTime := time.Now().Add(-time.Duration(f.config.FeedPruningHours) * time.Hour).Format(time.RFC3339)
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	_, err := f.db.ExecContext(ctx, "DELETE FROM news_items WHERE pub_date < ?", cutoffTime)
 	if err != nil {
 		return fmt.Errorf("failed to prune old items: %w", err)
 	}
 	return nil
 }
 
-// GetNewsItems fetches all news items from the last 24 hours
-func (f *NewsFeed) GetNewsItems() ([]NewsItem, error) {
+// GetNewsItems fetches all news items from the recent period
+func (f *NewsFeed) GetNewsItems(ctx context.Context) ([]NewsItem, error) {
 	f.newsItemsMux.RLock()
 	defer f.newsItemsMux.RUnlock()
 
-	// Get items from the last 24 hours
-	cutoffTime := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
-	rows, err := f.db.Query(
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Get items from the last period
+	cutoffTime := time.Now().Add(-time.Duration(f.config.FeedPruningHours) * time.Hour).Format(time.RFC3339)
+	rows, err := f.db.QueryContext(
+		ctx,
 		`SELECT id, title, link, description, pub_date, guid, source 
 		 FROM news_items 
 		 WHERE pub_date > ? 
@@ -199,11 +354,12 @@ func (f *NewsFeed) GetNewsItems() ([]NewsItem, error) {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
-		// Parse the timestamp using RFC3339 format
 		item.PubDate, err = time.Parse(time.RFC3339, pubDateStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse date '%s': %w", pubDateStr, err)
 		}
+
+		item.Sanitize()
 
 		items = append(items, item)
 	}
@@ -216,8 +372,8 @@ func (f *NewsFeed) GetNewsItems() ([]NewsItem, error) {
 }
 
 // GetXML returns the XML representation of the feed
-func (f *NewsFeed) GetXML() ([]byte, error) {
-	items, err := f.GetNewsItems()
+func (f *NewsFeed) GetXML(ctx context.Context) ([]byte, error) {
+	items, err := f.GetNewsItems(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -229,11 +385,25 @@ func (f *NewsFeed) GetXML() ([]byte, error) {
 	return xml.MarshalIndent(f, "", "  ")
 }
 
+// RateLimitMiddleware adds rate limiting to handlers
+func (f *NewsFeed) RateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !f.rateLimiter.Allow() {
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // FeedHandler handles HTTP requests for the feed
 func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
-	xmlData, err := f.GetXML()
+	ctx, cancel := context.WithTimeout(r.Context(), f.config.RequestTimeout)
+	defer cancel()
+
+	xmlData, err := f.GetXML(ctx)
 	if err != nil {
-		log.Printf("Error generating feed: %v", err)
+		log.Error().Err(err).Msg("Error generating feed")
 		http.Error(w, "Error generating feed", http.StatusInternalServerError)
 		return
 	}
@@ -242,94 +412,193 @@ func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(xmlData)
 }
 
-// CollectNews fetches and processes news
-func (f *NewsFeed) CollectNews() error {
+// HealthCheckHandler provides a basic health check endpoint
+func (f *NewsFeed) HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := f.db.PingContext(ctx); err != nil {
+		log.Error().Err(err).Msg("Health check failed - database error")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintln(w, "unhealthy - database error")
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "healthy")
+}
+
+// CollectNews fetches and processes news with retry logic
+func (f *NewsFeed) CollectNews(ctx context.Context) error {
 	log.Info().Msg("Collecting news...")
 
-	opts := gdelt.DefaultOpts
-	opts.Translingual = false
-	events, err := gdelt.FetchLatestEvents(opts)
-	if err != nil {
-		return fmt.Errorf("error fetching latest events: %w", err)
+	// Define retry parameters
+	maxRetries := 3
+	backoffDuration := 5 * time.Second
+
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Info().Int("attempt", attempt+1).Dur("backoff", backoffDuration).Msg("Retrying news collection")
+			select {
+			case <-time.After(backoffDuration):
+				// Continue with retry
+				backoffDuration *= 2 // Exponential backoff
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		// Fetch events with context and timeout
+		fetchCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		opts := gdelt.DefaultOpts
+		opts.Translingual = false
+		events, err := gdelt.FetchLatestEvents(fetchCtx, opts)
+		cancel()
+
+		if err != nil {
+			lastErr = fmt.Errorf("error fetching latest events (attempt %d): %w", attempt+1, err)
+			log.Error().Err(err).Int("attempt", attempt+1).Msg("Failed to fetch events")
+			continue // Try again
+		}
+
+		log.Info().Int("count", len(events)).Msg("Processing events")
+
+		collected := 0
+		for _, event := range events {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				// Continue processing
+			}
+
+			if !f.filter.Match(event.GKGArticle.Extras.PageTitle) {
+				log.Debug().Str("title", event.GKGArticle.Extras.PageTitle).Msg("Skipping event due to filter")
+				continue
+			}
+
+			newItem := NewsItem{
+				Title:       event.GKGArticle.Extras.PageTitle,
+				Link:        event.SourceURL,
+				PubDate:     event.PublishedAt(),
+				Source:      "GDELT",
+				Description: "", // Empty description, could be filled with summary or excerpt
+			}
+
+			newItem.GUID = GenerateGUID(newItem)
+
+			// Set a timeout for adding each item
+			itemCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			inserted, err := f.AddNewsItem(itemCtx, newItem)
+			cancel()
+
+			if err != nil {
+				log.Warn().Err(err).Str("title", newItem.Title).Msg("Error adding new item")
+				// Continue with other items rather than failing completely
+				continue
+			} else if inserted {
+				collected++
+			}
+		}
+
+		log.Info().Int("count", collected).Msg("Collected new items")
+		return nil // Success, exit the retry loop
 	}
 
-	log.Info().Int("count", len(events)).Msg("processing events")
-
-	collected := 0
-	for _, event := range events {
-		if !f.filter.Match(event.GKGArticle.Extras.PageTitle) {
-			log.Debug().Str("title", event.GKGArticle.Extras.PageTitle).Msg("skipping event due to filter")
-			continue
-		}
-
-		newItem := NewsItem{
-			Title:   event.GKGArticle.Extras.PageTitle,
-			Link:    event.SourceURL,
-			PubDate: event.PublishedAt(),
-			Source:  "GDELT",
-		}
-
-		newItem.GUID = GenerateGUID(newItem)
-
-		if inserted, err := f.AddNewsItem(newItem); err != nil {
-			log.Warn().Err(err).Str("title", newItem.Title).Msg("error adding new item")
-			// Continue with other items rather than failing completely
-			continue
-		} else if inserted {
-			collected += 1
-		}
-	}
-
-	log.Info().Int("count", collected).Msgf("collected %d items", collected)
-	return nil
+	return fmt.Errorf("failed to collect news after %d attempts: %w", maxRetries, lastErr)
 }
 
 func main() {
-	port := flag.Int("port", 8080, "Port to run the web server on")
-	flag.Parse()
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if os.Getenv("DEBUG") == "true" {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
 
-	feed, err := NewNewsFeed(
-		"GDELT Feed",
-		"https://reddot.watch/gdelt",
-		"A collection of GDELT news items from the last 24 hours",
-		"./gdelt_news_feed.db",
-	)
+	config := LoadConfig()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	feed, err := NewNewsFeed(ctx, config)
 	if err != nil {
-		log.Err(err).Msg("error initializing feed")
+		log.Fatal().Err(err).Msg("Error initializing feed")
 	}
 	defer feed.Close()
 
-	newsCollectionTicker := time.NewTicker(10 * time.Minute)
-	feedPruningTicker := time.NewTicker(24 * time.Hour)
+	newsCollectionTicker := time.NewTicker(time.Duration(config.NewsCollectionMinutes) * time.Minute)
+	feedPruningTicker := time.NewTicker(time.Duration(config.FeedPruningHours) * time.Hour)
+	defer newsCollectionTicker.Stop()
+	defer feedPruningTicker.Stop()
 
+	// Background worker for collection and pruning
 	go func() {
 		// Collect news immediately at startup
-		if err := feed.CollectNews(); err != nil {
-			log.Error().Err(err).Msg("initial news collection failed")
-			// Consider if you want to exit here or continue with the tickers
+		if err := feed.CollectNews(ctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			log.Error().Err(err).Msg("Initial news collection failed")
 		}
 
 		for {
 			select {
+			case <-ctx.Done():
+				log.Info().Msg("Shutting down background worker")
+				return
 			case <-newsCollectionTicker.C:
-				if err := feed.CollectNews(); err != nil {
-					log.Error().Err(err).Msg("periodic news collection failed")
-					// Continue execution, don't exit the goroutine
+				if err := feed.CollectNews(ctx); err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
+					log.Error().Err(err).Msg("Periodic news collection failed")
 				}
 			case <-feedPruningTicker.C:
-				if err := feed.PruneFeed(); err != nil {
-					log.Error().Err(err).Msg("feed pruning failed")
-					// Continue execution, don't exit the goroutine
+				if err := feed.PruneFeed(ctx); err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
+					log.Error().Err(err).Msg("Feed pruning failed")
 				}
 			}
 		}
 	}()
 
-	// Set up HTTP server to serve the feed
-	http.HandleFunc("/feed.xml", feed.FeedHandler)
+	mux := http.NewServeMux()
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", *port)
-	log.Printf("Starting server at http://localhost%s", serverAddr)
-	log.Fatal().Err(http.ListenAndServe(serverAddr, nil)).Send()
+	// Apply rate limiting middleware to feed endpoint
+	feedHandler := feed.RateLimitMiddleware(http.HandlerFunc(feed.FeedHandler))
+	mux.Handle("/feed.xml", feedHandler)
+
+	// Add health check endpoint
+	mux.HandleFunc("/health", feed.HealthCheckHandler)
+
+	server := &http.Server{
+		Addr:         fmt.Sprintf(":%d", config.Port),
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		log.Info().Int("port", config.Port).Msg("Starting server")
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal().Err(err).Msg("Server error")
+		}
+	}()
+
+	<-ctx.Done()
+	log.Info().Msg("Shutdown signal received")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Error().Err(err).Msg("Server shutdown error")
+	}
+
+	log.Info().Msg("Server gracefully stopped")
 }
