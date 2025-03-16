@@ -468,12 +468,15 @@ func (f *NewsFeed) HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // CollectNews fetches and processes news with retry logic
-func (f *NewsFeed) CollectNews(ctx context.Context) error {
+func (f *NewsFeed) CollectNews(ctx context.Context) (int, error) {
 	log.Info().Msg("Collecting news...")
 
 	// Define retry parameters
 	maxRetries := 3
 	backoffDuration := 5 * time.Second
+
+	// Effectively collected news
+	collected := 0
 
 	var lastErr error
 
@@ -485,7 +488,7 @@ func (f *NewsFeed) CollectNews(ctx context.Context) error {
 				// Continue with retry
 				backoffDuration *= 2 // Exponential backoff
 			case <-ctx.Done():
-				return ctx.Err()
+				return collected, ctx.Err()
 			}
 		}
 
@@ -504,11 +507,10 @@ func (f *NewsFeed) CollectNews(ctx context.Context) error {
 
 		log.Info().Int("count", len(events)).Msg("Processing events")
 
-		collected := 0
 		for _, event := range events {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return collected, ctx.Err()
 			default:
 				// Continue processing
 			}
@@ -543,10 +545,10 @@ func (f *NewsFeed) CollectNews(ctx context.Context) error {
 		}
 
 		log.Info().Int("count", collected).Msg("Collected new items")
-		return nil // Success, exit the retry loop
+		return collected, nil // Success, exit the retry loop
 	}
 
-	return fmt.Errorf("failed to collect news after %d attempts: %w", maxRetries, lastErr)
+	return collected, fmt.Errorf("failed to collect news after %d attempts: %w", maxRetries, lastErr)
 }
 
 func main() {
@@ -572,20 +574,27 @@ func main() {
 	defer newsCollectionTicker.Stop()
 	defer feedPruningTicker.Stop()
 
-	// Background worker for collection and pruning
-	go func() {
+	updateFeed := func() {
 		// Collect news immediately at startup
-		if err := feed.CollectNews(ctx); err != nil {
+		collected, err := feed.CollectNews(ctx)
+		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
 			log.Error().Err(err).Msg("Initial news collection failed")
-		} else {
+		}
+
+		if collected > 0 {
 			// Generate new XML file after successful collection
 			if err := feed.GenerateAndSaveXML(ctx); err != nil {
 				log.Error().Err(err).Msg("XML generation failed")
 			}
 		}
+	}
+
+	// Background worker for collection and pruning
+	go func() {
+		updateFeed()
 
 		for {
 			select {
@@ -593,17 +602,7 @@ func main() {
 				log.Info().Msg("Shutting down background worker")
 				return
 			case <-newsCollectionTicker.C:
-				if err := feed.CollectNews(ctx); err != nil {
-					if errors.Is(err, context.Canceled) {
-						return
-					}
-					log.Error().Err(err).Msg("Periodic news collection failed")
-				} else {
-					// Generate new XML file after successful collection
-					if err := feed.GenerateAndSaveXML(ctx); err != nil {
-						log.Error().Err(err).Msg("XML generation failed")
-					}
-				}
+				updateFeed()
 			case <-feedPruningTicker.C:
 				if err := feed.PruneFeed(ctx); err != nil {
 					if errors.Is(err, context.Canceled) {
