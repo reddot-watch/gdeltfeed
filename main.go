@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -38,6 +39,8 @@ type Config struct {
 	MaxDBConnections      int
 	RequestTimeout        time.Duration
 	MaxRequestsPerMinute  int
+	xmlFilePath           string
+	xmlTempFilePath       string
 }
 
 // LoadConfig loads configuration from environment variables and flags
@@ -57,6 +60,10 @@ func LoadConfig() Config {
 	flag.IntVar(&config.MaxRequestsPerMinute, "max-requests", getEnvInt("MAX_REQUESTS_PER_MINUTE", 60), "Maximum requests per minute")
 
 	flag.Parse()
+
+	config.xmlFilePath = filepath.Join(filepath.Dir(config.DBPath), "feed.xml")
+	config.xmlTempFilePath = filepath.Join(filepath.Dir(config.DBPath), "feed.xml.tmp")
+
 	return config
 }
 
@@ -125,6 +132,7 @@ type NewsFeed struct {
 	filter       *prefilter.Filter
 	config       Config
 	rateLimiter  *RateLimiter
+	xmlFileMux   sync.RWMutex
 }
 
 // Channel contains feed metadata and items
@@ -396,20 +404,51 @@ func (f *NewsFeed) RateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// FeedHandler handles HTTP requests for the feed
-func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), f.config.RequestTimeout)
-	defer cancel()
+// New method to generate and save XML to file
+func (f *NewsFeed) GenerateAndSaveXML(ctx context.Context) error {
+	// Lock during file writing
+	f.xmlFileMux.Lock()
+	defer f.xmlFileMux.Unlock()
 
 	xmlData, err := f.GetXML(ctx)
 	if err != nil {
-		log.Error().Err(err).Msg("Error generating feed")
-		http.Error(w, "Error generating feed", http.StatusInternalServerError)
+		return err
+	}
+
+	// Write to temporary file first
+	if err := os.WriteFile(f.config.xmlTempFilePath, xmlData, 0644); err != nil {
+		return fmt.Errorf("failed to write temp XML file: %w", err)
+	}
+
+	// Atomic rename to ensure consistency
+	if err := os.Rename(f.config.xmlTempFilePath, f.config.xmlFilePath); err != nil {
+		return fmt.Errorf("failed to replace XML file: %w", err)
+	}
+
+	log.Info().Str("path", f.config.xmlFilePath).Msg("XML feed file updated")
+	return nil
+}
+
+// FeedHandler serves the static XML file
+func (f *NewsFeed) FeedHandler(w http.ResponseWriter, r *http.Request) {
+	// Add read lock to ensure file isn't being written during read
+	f.xmlFileMux.RLock()
+	defer f.xmlFileMux.RUnlock()
+
+	if _, err := os.Stat(f.config.xmlFilePath); os.IsNotExist(err) {
+		log.Error().Str("path", f.config.xmlFilePath).Msg("Feed file does not exist")
+		// Return 503 Service Unavailable with a meaningful message
+		w.Header().Set("Retry-After", "60") // Suggest client retry after 60 seconds
+		http.Error(w, "Feed is currently being generated. Please try again later.",
+			http.StatusServiceUnavailable)
 		return
 	}
 
+	// Set caching headers
 	w.Header().Set("Content-Type", "application/xml")
-	w.Write(xmlData)
+	w.Header().Set("Cache-Control", "public, max-age=300") // 5-minute cache
+
+	http.ServeFile(w, r, f.config.xmlFilePath)
 }
 
 // HealthCheckHandler provides a basic health check endpoint
@@ -541,6 +580,11 @@ func main() {
 				return
 			}
 			log.Error().Err(err).Msg("Initial news collection failed")
+		} else {
+			// Generate new XML file after successful collection
+			if err := feed.GenerateAndSaveXML(ctx); err != nil {
+				log.Error().Err(err).Msg("XML generation failed")
+			}
 		}
 
 		for {
@@ -554,6 +598,11 @@ func main() {
 						return
 					}
 					log.Error().Err(err).Msg("Periodic news collection failed")
+				} else {
+					// Generate new XML file after successful collection
+					if err := feed.GenerateAndSaveXML(ctx); err != nil {
+						log.Error().Err(err).Msg("XML generation failed")
+					}
 				}
 			case <-feedPruningTicker.C:
 				if err := feed.PruneFeed(ctx); err != nil {
