@@ -223,7 +223,11 @@ func NewNewsFeed(ctx context.Context, config Config) (*NewsFeed, error) {
 		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
 
-	prefilter, err := prefilter.NewFilter("en", prefilter.DefaultOptions())
+	filter, err := prefilter.NewFilter("en", prefilter.Options{
+		AllowedGap:      2,
+		TypoThreshold:   0,
+		PreserveHyphens: true,
+	})
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create filter: %w", err)
@@ -240,7 +244,7 @@ func NewNewsFeed(ctx context.Context, config Config) (*NewsFeed, error) {
 			Items:         []NewsItem{},
 		},
 		db:          db,
-		filter:      prefilter,
+		filter:      filter,
 		config:      config,
 		rateLimiter: NewRateLimiter(config.MaxRequestsPerMinute),
 	}, nil
